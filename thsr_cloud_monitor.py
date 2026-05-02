@@ -8,8 +8,12 @@
 """
 
 import os, time, json, requests, schedule
+import urllib3
 from bs4 import BeautifulSoup
 from datetime import datetime
+
+# 高鐵官網 SSL 憑證在部分雲端環境驗證失敗，關閉警告
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 STATION_UUID = {
     "南港": "d3de6820-d1f5-4a82-a40b-638b46628ec1",
@@ -73,7 +77,7 @@ def fetch_trains(from_station, to_station, date, search_time="00:00"):
         "SearchWay": "DepartureInMandarin", "RestTime": "", "EarlyOrLater": "",
     }
     try:
-        resp = requests.post(THSR_URL, data=payload, headers=headers, timeout=20)
+        resp = requests.post(THSR_URL, data=payload, headers=headers, timeout=20, verify=False)
         resp.raise_for_status()
     except requests.RequestException as e:
         print(f"  ⚠️  HTTP 失敗：{e}")
