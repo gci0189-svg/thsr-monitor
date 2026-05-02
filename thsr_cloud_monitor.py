@@ -1,43 +1,75 @@
 #!/usr/bin/env python3
 """
-台灣高鐵餘位監控程式 ── 雲端版 v3
-- 從 config.json 讀取監控任務，支援多條路線、時段過濾
-- 通知使用 LINE Messaging API
+台灣高鐵餘位監控程式 ── 雲端版 v4
+改用 TDX 政府開放資料 API 查詢即時剩餘座位
+- 不需要爬官網，穩定不會被擋
+- StandardSeatStatus: O=有位, L=剩少量, X=售完
 
-套件需求：pip install requests beautifulsoup4 schedule
+套件需求：pip install requests schedule
 """
 
 import os, time, json, requests, schedule
-import urllib3
-from bs4 import BeautifulSoup
 from datetime import datetime
 
-# 高鐵官網 SSL 憑證在部分雲端環境驗證失敗，關閉警告
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-STATION_UUID = {
-    "南港": "d3de6820-d1f5-4a82-a40b-638b46628ec1",
-    "台北": "977abb69-413a-4ccf-a109-0272c24fd490",
-    "板橋": "2f940836-cedc-4c89-b922-0db7a8741acc",
-    "桃園": "d3d79b04-8a3e-4b87-96d5-50d2b4afe44e",
-    "新竹": "d0346497-CBCA-4D6F-ae3f-789d6187d7d0",
-    "苗栗": "d7cc55f5-d7d6-4d94-b676-a72e09dd3c5a",
-    "台中": "f2519629-5973-4d08-913b-479cce78a356",
-    "彰化": "d6f9ae57-c6df-4d9d-ab44-bd81399cde97",
-    "雲林": "d60de246-1b53-4dca-b6fd-3ca63af0a0f0",
-    "嘉義": "9c51e1dd-5500-4591-8aa3-3e9e08d3e9d1",
-    "台南": "6ce89ee5-547a-4c35-9eb3-18e8f50e2e80",
-    "左營": "1d0bf062-4f1c-4d3e-8d50-d4e1c2609b99",
+# ============================================================
+# 站名 → TDX StationID 對照
+# ============================================================
+STATION_ID = {
+    "南港": "0990",
+    "台北": "1000",
+    "板橋": "1010",
+    "桃園": "1020",
+    "新竹": "1030",
+    "苗栗": "1035",
+    "台中": "1040",
+    "彰化": "1043",
+    "雲林": "1047",
+    "嘉義": "1050",
+    "台南": "1060",
+    "左營": "1070",
 }
 
-THSR_URL      = "https://www.thsrc.com.tw/tw/TimeTable/SearchResult"
 LINE_PUSH_URL = "https://api.line.me/v2/bot/message/push"
+TDX_BASE      = "https://tdx.transportdata.tw/api/basic/v2/Rail/THSR"
 
+# ============================================================
+# 讀取設定檔
+# ============================================================
 def load_config():
     path = os.path.join(os.path.dirname(__file__), "config.json")
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
+# ============================================================
+# TDX Token（免費申請，每天 50000 次）
+# 申請：https://tdx.transportdata.tw/register
+# 不填也可用，但有流量限制
+# ============================================================
+def get_tdx_headers():
+    client_id     = os.getenv("TDX_CLIENT_ID", "")
+    client_secret = os.getenv("TDX_CLIENT_SECRET", "")
+    headers = {"Accept": "application/json"}
+
+    if client_id and client_secret:
+        try:
+            token_resp = requests.post(
+                "https://tdx.transportdata.tw/auth/realms/TDXConnect/protocol/openid-connect/token",
+                data={"grant_type": "client_credentials",
+                      "client_id": client_id,
+                      "client_secret": client_secret},
+                timeout=10,
+            )
+            if token_resp.status_code == 200:
+                token = token_resp.json().get("access_token", "")
+                headers["Authorization"] = f"Bearer {token}"
+        except Exception:
+            pass  # 沒 token 還是可以用，只是有流量限制
+
+    return headers
+
+# ============================================================
+# LINE 通知
+# ============================================================
 def send_line_message(text, token, user_id):
     if not token or not user_id:
         print("  ⚠️  LINE 設定未完成，跳過通知")
@@ -58,50 +90,97 @@ def send_line_message(text, token, user_id):
         print(f"  ❌ LINE 錯誤：{e}")
         return False
 
-def fetch_trains(from_station, to_station, date, search_time="00:00"):
-    from_uuid = STATION_UUID.get(from_station)
-    to_uuid   = STATION_UUID.get(to_station)
-    if not from_uuid or not to_uuid:
+# ============================================================
+# 查詢即時剩餘座位（TDX API）
+# ============================================================
+def fetch_available_trains(from_station, to_station, date):
+    """
+    使用 TDX AvailableSeatStatus API 查詢指定日期起迄站的即時剩餘座位
+    回傳有位班次清單：[{"train": "0601", "depart": "07:00", "status": "O"}]
+    """
+    from_id = STATION_ID.get(from_station)
+    to_id   = STATION_ID.get(to_station)
+    if not from_id or not to_id:
         print(f"  ⚠️  找不到站名：{from_station} / {to_station}")
         return []
-    headers = {
-        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                       "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Referer": "https://www.thsrc.com.tw/ArticleContent/a3b630bb-1066-4352-a1ef-58c7b4e8ef7c",
-        "Origin":  "https://www.thsrc.com.tw",
-    }
-    payload = {
-        "StartStation": from_uuid, "EndStation": to_uuid,
-        "SearchDate": date, "SearchTime": search_time,
-        "SearchWay": "DepartureInMandarin", "RestTime": "", "EarlyOrLater": "",
-    }
+
+    # 格式化日期 YYYY-MM-DD
+    date_fmt = date.replace("/", "-")
+
+    # 先取時刻表（含出發時間）
+    timetable_url = (
+        f"{TDX_BASE}/DailyTimetable/OD/{from_id}/to/{to_id}/{date_fmt}"
+        f"?$format=JSON"
+    )
+    # 取即時剩餘座位
+    seat_url = (
+        f"{TDX_BASE}/AvailableSeatStatus/Train/OD/{from_id}/to/{to_id}"
+        f"/TrainDate/{date_fmt}?$format=JSON"
+    )
+
+    headers = get_tdx_headers()
+
     try:
-        resp = requests.post(THSR_URL, data=payload, headers=headers, timeout=20, verify=False)
-        resp.raise_for_status()
-    except requests.RequestException as e:
-        print(f"  ⚠️  HTTP 失敗：{e}")
+        tt_resp   = requests.get(timetable_url, headers=headers, timeout=15)
+        seat_resp = requests.get(seat_url,      headers=headers, timeout=15)
+
+        if tt_resp.status_code != 200:
+            print(f"  ⚠️  時刻表 API 失敗({tt_resp.status_code})")
+            return []
+        if seat_resp.status_code != 200:
+            print(f"  ⚠️  座位 API 失敗({seat_resp.status_code})")
+            return []
+
+        timetable = tt_resp.json()
+        seat_data = seat_resp.json()
+
+    except Exception as e:
+        print(f"  ⚠️  API 請求錯誤：{e}")
         return []
 
-    soup   = BeautifulSoup(resp.text, "html.parser")
-    trains = []
-    rows   = soup.select("table.result-table tbody tr, .result tbody tr, #result tbody tr")
-    for row in rows:
-        cols = row.find_all("td")
-        if len(cols) < 2:
-            continue
-        train_no = cols[0].get_text(strip=True)
-        depart   = cols[1].get_text(strip=True)
-        arrive   = cols[2].get_text(strip=True) if len(cols) > 2 else ""
-        has_book = bool(row.find("a", string=lambda t: t and "訂位" in t))
-        soldout  = any(kw in row.get_text() for kw in ["售完", "額滿", "候補", "SoldOut"])
-        if train_no:
-            trains.append({"train": train_no, "depart": depart,
-                           "arrive": arrive, "available": has_book and not soldout})
-    if not trains and soup.find("a", string=lambda t: t and "訂位" in t):
-        trains.append({"train": "?", "depart": "?", "arrive": "?", "available": True})
-    return trains
+    # 建立車次 → 出發時間對照
+    depart_map = {}
+    for item in timetable:
+        train_no = item.get("DailyTrainInfo", {}).get("TrainNo", "")
+        stops    = item.get("StopTimes", [])
+        for stop in stops:
+            if stop.get("StationID") == from_id:
+                depart_map[train_no] = stop.get("DepartureTime", "?")
+                break
 
+    # 建立車次 → 到達時間對照
+    arrive_map = {}
+    for item in timetable:
+        train_no = item.get("DailyTrainInfo", {}).get("TrainNo", "")
+        stops    = item.get("StopTimes", [])
+        for stop in stops:
+            if stop.get("StationID") == to_id:
+                arrive_map[train_no] = stop.get("ArrivalTime", "?")
+                break
+
+    # 解析座位狀態
+    # StandardSeatStatus: O=有位, L=少量剩餘, X=售完
+    available = []
+    for train in seat_data:
+        train_no = train.get("TrainNo", "")
+        stops    = train.get("StopStations", [])
+        for stop in stops:
+            if stop.get("StationID") == from_id:
+                status = stop.get("StandardSeatStatus", "X")
+                if status in ("O", "L"):   # O=有位 L=少量
+                    available.append({
+                        "train":  train_no,
+                        "depart": depart_map.get(train_no, "?"),
+                        "arrive": arrive_map.get(train_no, "?"),
+                        "status": status,
+                    })
+                break
+
+    return available
+
+# ============================================================
+# 時段過濾
+# ============================================================
 def in_time_range(depart_str, time_from, time_to):
     try:
         t      = datetime.strptime(depart_str[:5], "%H:%M").time()
@@ -111,7 +190,10 @@ def in_time_range(depart_str, time_from, time_to):
     except Exception:
         return True
 
-def make_checker(task, token, user_id, notified):
+# ============================================================
+# 主監控邏輯
+# ============================================================
+def make_checker(task, line_token, user_id, notified):
     label     = task["label"]
     from_s    = task["from"]
     to_s      = task["to"]
@@ -122,37 +204,34 @@ def make_checker(task, token, user_id, notified):
     def check():
         now = datetime.now().strftime("%H:%M:%S")
         print(f"[{now}] [{label}] 查詢中...", end=" ", flush=True)
-        trains    = fetch_trains(from_s, to_s, date, time_from)
-        in_range  = [t for t in trains if in_time_range(t["depart"], time_from, time_to)]
-        available = [t for t in in_range if t["available"]]
 
-        if not trains:
-            print("查無結果")
-            return
+        trains    = fetch_available_trains(from_s, to_s, date)
+        in_range  = [t for t in trains if in_time_range(t["depart"], time_from, time_to)]
+
         if not in_range:
-            print(f"時段 {time_from}~{time_to} 內無班次")
+            print(f"時段 {time_from}~{time_to} 無可訂班次，繼續監控...")
             return
-        if available:
-            print(f"🎉 {len(available)} 班有票！")
-            for t in available:
-                key = f"{label}_{t['train']}_{t['depart']}"
-                if key not in notified:
-                    notified.add(key)
-                    send_line_message(
-                        f"🎉 高鐵有票啦！快搶！\n"
-                        f"【{label}】\n"
-                        f"日期：{date}\n"
-                        f"路線：{from_s} → {to_s}\n"
-                        f"車次：{t['train']}｜出發：{t['depart']}｜到達：{t['arrive']}\n"
-                        f"立刻訂票 👉 https://irs.thsrc.com.tw/IMINT/",
-                        token, user_id
-                    )
-                    print(f"  → 車次 {t['train']} ({t['depart']}) 已通知")
-        else:
-            print(f"時段內 {len(in_range)} 班全售完，繼續監控...")
+
+        print(f"🎉 {len(in_range)} 班有票！")
+        for t in in_range:
+            key = f"{label}_{t['train']}_{t['depart']}"
+            if key not in notified:
+                notified.add(key)
+                qty_label = "⚡ 剩少量" if t["status"] == "L" else "✅ 有位"
+                send_line_message(
+                    f"🎉 高鐵有票啦！快搶！\n"
+                    f"【{label}】{qty_label}\n"
+                    f"日期：{date}\n"
+                    f"路線：{from_s} → {to_s}\n"
+                    f"車次：{t['train']}｜出發：{t['depart']}｜到達：{t['arrive']}\n"
+                    f"立刻訂票 👉 https://irs.thsrc.com.tw/IMINT/",
+                    line_token, user_id
+                )
+                print(f"  → 車次 {t['train']} ({t['depart']}) {qty_label} 已通知")
 
     return check
 
+# ============================================================
 def main():
     cfg      = load_config()
     tasks    = cfg.get("tasks", [])
@@ -162,9 +241,8 @@ def main():
     notified = set()
 
     print("=" * 55)
-    print("🚄  台灣高鐵餘位監控（雲端版 v3）  🚄")
+    print("🚄  台灣高鐵餘位監控（雲端版 v4 / TDX API）  🚄")
     print("=" * 55)
-    print(f"  監控任務數：{len(tasks)} 條")
     for t in tasks:
         print(f"  ・{t['label']}  {t['date']}  {t['time_from']}~{t['time_to']}")
     print(f"  查詢間隔：每 {interval} 秒")
@@ -174,7 +252,7 @@ def main():
         f"・{t['label']} {t['time_from']}~{t['time_to']}" for t in tasks
     )
     send_line_message(
-        f"🚄 高鐵監控已啟動！\n{task_summary}\n每 {interval} 秒查一次，有票馬上通知！",
+        f"🚄 高鐵監控已啟動！（v4 TDX API）\n{task_summary}\n每 {interval} 秒查一次，有票馬上通知！",
         token, user_id
     )
 
